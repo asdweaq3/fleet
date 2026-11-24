@@ -272,6 +272,39 @@ jobs:
           python -c 'import camoufox, geoip2, playwright; print("imports=ok")'
           "$HOME/.cache/camoufox/camoufox-bin" --version
 
+      # GEOIP DATABASE, FETCHED WITH A TOKEN. `geoip=True` (set whenever a proxy is
+      # used) makes camoufox download GeoLite2-City.mmdb into its own package dir on
+      # every fresh install, via an UNAUTHENTICATED api.github.com call, and that
+      # package dir is never cached. A shared runner IP that has used up its 60/h
+      # gets `403 rate limit exceeded`, every session start fails ~2 s apart, and
+      # the runner mints ZERO while the job stays green (seen 2026-11-24, 306
+      # failures in 12 min on a new repo). An authenticated call has 1000/h.
+      - name: Pre-fetch the GeoIP database (authenticated)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dest="$(python -c 'import camoufox.locale as l; print(l.MMDB_FILE)')"
+          cat > /tmp/geoasset.py <<'PY'
+          import json, sys
+          for release in json.load(sys.stdin):
+              for asset in release["assets"]:
+                  if asset["name"].endswith("-City.mmdb"):
+                      print(asset["browser_download_url"])
+                      raise SystemExit
+          PY
+          for attempt in 1 2 3 4 5; do
+            url="$(curl -fsS --max-time 30 -H "Authorization: Bearer $GH_TOKEN"               https://api.github.com/repos/P3TERX/GeoLite.mmdb/releases               | python /tmp/geoasset.py || true)"
+            if [ -n "$url" ] && curl -fsSL --retry 3 --retry-all-errors --max-time 120 -o "$dest" "$url"                && [ "$(stat -c %s "$dest")" -gt 1000000 ]; then
+              ls -l "$dest"; exit 0
+            fi
+            echo "geoip fetch attempt $attempt failed; backing off" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "could not fetch the GeoIP database" >&2
+          exit 1
+
       # RUNG 4's browser. continue-on-error because a missing Chromium must
       # degrade the ladder by one rung, never kill a 300-minute producer: the
       # generator catches the launch failure and escalates past it.
