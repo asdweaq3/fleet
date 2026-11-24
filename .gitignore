@@ -1,0 +1,4 @@
+# Keep the pushed tree clean. The production repository accidentally carries
+# committed .pyc files; there is no reason to reproduce that.
+__pycache__/
+*.pyc

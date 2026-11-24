@@ -1,0 +1,4 @@
+# Preserve bytes exactly. Two of these files ship with CRLF line endings AS
+# DEPLOYED, and their verified hashes (see ../MANIFEST.md) are of those exact
+# bytes. A core.autocrlf setting must not rewrite them.
+* -text

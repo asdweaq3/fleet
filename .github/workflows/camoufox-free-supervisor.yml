@@ -1,0 +1,380 @@
+name: Camoufox free-fleet supervisor
+run-name: supervisor (target=${{ vars.CAMOUFOX_FLEET_TARGET }} enabled=${{ vars.CAMOUFOX_FLEET_ENABLED }})
+
+# ============================================================================
+#  HOW TO STOP THE FLEET  —  ORDER MATTERS, AND IT IS THE WHOLE POINT
+# ============================================================================
+#
+#  1. FLIP THE SWITCH OFF (one API call, no commit, no workflow run):
+#
+#       curl -X PATCH -H "Authorization: Bearer $TOKEN" \
+#         -H "Accept: application/vnd.github+json" \
+#         https://api.github.com/repos/$GITHUB_REPOSITORY/actions/variables/CAMOUFOX_FLEET_ENABLED \
+#         -d '{"name":"CAMOUFOX_FLEET_ENABLED","value":"false"}'
+#
+#     From this moment nothing new can ever be dispatched. The supervisor still
+#     ticks, reads the variable, prints "FLEET DISABLED" and exits. Producers
+#     have no cron and no successor dispatch, so there is nothing else that can
+#     start a run.
+#
+#  2. ONLY THEN cancel the runs that are still alive:
+#
+#       curl -X POST -H "Authorization: Bearer $TOKEN" \
+#         https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/<ID>/cancel
+#
+#     A 409 means "already terminating" — that is success, not an error. Give it
+#     ~45 s to drain; do not retry in a loop.
+#
+#  Cancelling FIRST is futile and is exactly how the previous runaway incident
+#  burned ~15 runs: kill the source of new runs, then clean up the existing
+#  ones. If in doubt you can also belt-and-braces disable the whole workflow:
+#
+#       curl -X PUT .../actions/workflows/camoufox-free-supervisor.yml/disable
+#
+#  TO START IT AGAIN: set CAMOUFOX_FLEET_ENABLED back to "true" (and re-enable
+#  the workflow if you disabled it). The next cron tick refills the fleet.
+#
+#  TO RESIZE: set CAMOUFOX_FLEET_TARGET. No commit, no redeploy.
+#
+# ============================================================================
+#  MINTING LIVENESS — a runner that produces nothing must stop counting
+# ============================================================================
+#
+#  GitHub reports a wedged producer as a healthy `in_progress` job. Measured
+#  2026-08-01: run 30700078405 (`f51`) posted tokens for 21 minutes and then
+#  nothing for four hours, counted the whole time toward both `alive` and
+#  `productive` — and since `hard_cap` is measured against `alive`, it also
+#  SUPPRESSED the replacement that would have compensated for it.
+#
+#  So the supervisor now scores each runner on the relay's own record of who
+#  minted (see assess_minting in fleet_master.py) and drops a silent one out of
+#  `productive`. It is OFF unless the secret below exists, and every ambiguity
+#  resolves to "do nothing":
+#
+#    gh secret set RELAY_STATS_AUTH -R $GITHUB_REPOSITORY -b '<relay X-Auth>'
+#
+#  Knobs, all optional repo variables:
+#    CAMOUFOX_FLEET_STALL_SECONDS   silence that counts as stalled (default 2700)
+#    CAMOUFOX_FLEET_STALL_STARTUP   grace after the Produce step starts (900)
+#    CAMOUFOX_FLEET_STALL_CANCEL    stalled runs to CANCEL per cycle (default 0 =
+#                                   never; downgrading is the normal remedy, and
+#                                   cancelling destroys the run's end-of-run
+#                                   summary — our only post-hoc diagnostic)
+#    CAMOUFOX_FLEET_EXITS_URL       override the relay endpoint
+#
+#  TO DISABLE ENTIRELY: delete the RELAY_STATS_AUTH secret. The next tick reads
+#  an empty credential, skips the check, and behaves exactly as it did before.
+#
+# ============================================================================
+#  THE DISPATCH CREDENTIAL — WHY A PAT, AND WHY THE CHAIN DIED WITHOUT ONE
+# ============================================================================
+#
+#  GitHub does not raise workflow-triggering events for actions performed with
+#  the default `GITHUB_TOKEN`. So a supervisor that dispatches with it builds a
+#  chain exactly ONE generation deep: a producer the operator dispatched wakes
+#  this supervisor when it ends, but the replacement this supervisor dispatches
+#  ends SILENTLY — no event, no wake, no successor — and the fleet is left to
+#  the `schedule:` cron, which has been measured firing every 65-139 min on
+#  mature accounts and once not at all for 2h35m.
+#
+#  Measured, not inferred (2026-08-05, one fleet account, the two arms 15m42s
+#  apart in one window, the credential the only varying factor — the write-up
+#  is kept off this file because it ships into every fleet repo, and the repos
+#  are public):
+#
+#    arm G  producer dispatched with GITHUB_TOKEN  -> NO supervisor run of any
+#                                                     kind in the 6m14s after it
+#                                                     completed
+#    arm U  producer dispatched with a user token  -> supervisor woke on
+#                                                     `workflow_run` in 3 s
+#
+#  Hence: this job prefers a per-account fine-grained PAT and falls back to the
+#  default token when the secret is absent, so an account that has not been
+#  given a PAT keeps behaving EXACTLY as it does today rather than failing shut.
+#
+#  ── OPERATOR PREREQUISITE. Only you can do this; an agent cannot.
+#
+#    Create, PER ACCOUNT, a fine-grained PAT scoped to *Actions: read and
+#    write*, restricted to that account's fleet repo ONLY, and store it as a
+#    repo secret named FLEET_DISPATCH_PAT:
+#
+#      gh secret set FLEET_DISPATCH_PAT -R <owner>/<repo> -b '<the PAT>'
+#
+#    The PAT is used for READS as well as dispatches. That is deliberate:
+#    threading two credentials through fleet_master.py buys nothing, and the
+#    scope dispatch needs already covers the reads.
+#
+#  ── RECORD THIS REPO'S PAT EXPIRY HERE WHEN YOU ISSUE ONE, and keep the
+#    four-account ledger in the ticket, NOT here: this file is uploaded verbatim
+#    into every fleet repo and those repos are public, so a list of the sibling
+#    accounts in it would cross-link them to anyone who reads one.
+#
+#      PAT issued: ____________   expires: ____________
+#
+#    An EXPIRED PAT is the one failure this fallback does not absorb — it is
+#    non-empty, so it is preferred, and every API call the planner makes then
+#    401s. That is loud rather than silent: `fleet_master.py` raises on a
+#    non-2xx and the whole tick goes RED, which breaks the "every prior run
+#    reads success" signature that made the original decay invisible. Nothing is
+#    dispatched while it lasts, so treat a red supervisor as urgent; deleting
+#    the secret restores the old behaviour immediately.
+#
+#  ── ROLLOUT is per-account and incremental — the fallback is what makes a
+#    partial rollout safe. Prove it on one account across two full producer
+#    generations before issuing three more tokens.
+#
+#  ── REVERT: delete the secret. The next tick reads an empty value and this
+#    supervisor is exactly what it was before. No upload, no commit.
+#
+#      gh secret delete FLEET_DISPATCH_PAT -R <owner>/<repo>
+#
+#  ── WHAT A PAT DOES NOT CHANGE. CAMOUFOX_FLEET_ENABLED, TARGET and HARD_CAP
+#    still govern every dispatch, so one completion still produces at most one
+#    replacement; a higher-privileged credential buys no extra runners. The
+#    `concurrency` group below still collapses a burst of completions into a
+#    single reconcile, and the `schedule:` cron stays — it is the only thing
+#    that can restart a fleet already at ZERO, because with no producers there
+#    are no completion events to wake anything.
+#
+# ============================================================================
+#
+# Why a supervisor at all, rather than a producer that dispatches its own
+# successor: a dying run's `if: always()` successor dispatch respawns faster
+# than it can be cancelled, which is the documented incident this design exists
+# to prevent. Producers here are strictly passive — no cron, no self-dispatch.
+#
+# Why not `camoufox-supervisor.yml`: that one drives the metered **Webshare**
+# fleet and derives its size from a bandwidth budget (BUDGET_SLOTS /
+# BUDGET_GB_PER_30D). This fleet spends zero metered bytes, so that coupling
+# would be a meaningless constraint wearing a safety property's clothes. The
+# Webshare workflows stay `disabled_manually` and untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Plan only — print what would be dispatched, dispatch nothing
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+  # ── EVENT-DRIVEN REFILL. The cron below is NOT reliable enough on its own.
+  #
+  # `schedule:` asks for every 20 min. Measured on free public repos across four
+  # independent accounts (2026-08-02..04): it fired every 65-139 min on mature
+  # accounts, every 216-386 min on new ones, and once stopped ENTIRELY for
+  # 2h35m — on two unrelated accounts within one minute of each other, while
+  # `state` read `active` and every prior run read `success`. GitHub
+  # deprioritises scheduled workflows there, and the simultaneity across
+  # unrelated accounts says platform-side, not per-repo.
+  #
+  # A supervisor that does not run cannot replace an expiring producer, so the
+  # fleet decays — and if the runners were dispatched together it collapses to
+  # ZERO in one step (observed 2026-08-04: 12 runners, two cohorts, both ran a
+  # clean 5h01m to `success`, both ended together, account left at 0 producers).
+  #
+  # THE MOMENT A REPLACEMENT IS NEEDED IS THE MOMENT A PRODUCER ENDS — so wake
+  # on that event rather than polling on a timer that may never tick.
+  #
+  # ⚠️ This is NOT the runaway-respawn incident. That was a PRODUCER dispatching
+  # its own successor from `if: always()` — an uncapped self-replicating loop
+  # that burned ~15 runs. Here the SUPERVISOR wakes, and it still honours
+  # CAMOUFOX_FLEET_ENABLED, TARGET and HARD_CAP, so it cannot dispatch past
+  # target; one completion produces at most one replacement. The concurrency
+  # group below collapses bursts (e.g. cancelling a whole fleet at once) into a
+  # single reconcile.
+  #
+  # The cron is deliberately KEPT as a backstop: it is the only thing that can
+  # restart a fleet that has reached zero, because with no producers left there
+  # are no completion events to wake anything.
+  workflow_run:
+    workflows: ["Gartic Camoufox FLEET (supervisor-driven)"]
+    types: [completed]
+
+  schedule:
+    # Every 20 minutes, NOT every 5 — the short cadence starved this supervisor
+    # of the very runner it needs to do its job.
+    #
+    # `cancel-in-progress: true` below means each tick cancels the previous one.
+    # That is right for a reconciler (always act on fresh state) but it assumes
+    # a tick can START within one interval. GitHub grants this account a runner
+    # roughly every 6-12 min under load, so a 5-minute cadence guaranteed that
+    # most ticks were cancelled while still queued: observed live as #17
+    # `cancelled` and #18 sitting queued for 37 min, during which the fleet
+    # decayed 12 -> 7 producers with nothing refilling it and the standing queue
+    # fell 2,815 -> 1,615.
+    #
+    # 20 min comfortably exceeds the grant latency, so a tick can win a runner
+    # and reconcile before its successor supersedes it. It is still far below
+    # --overlap-seconds (1800) and DURATION (18000), so replacements are still
+    # dispatched well before their predecessors expire; lateness eats overlap
+    # rather than creating a gap.
+    - cron: "*/20 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: camoufox-free-fleet-supervisor
+  # ⚠️ WAS `true` UNTIL 2026-08-06. The comment above diagnosed this exactly —
+  # "it assumes a tick can START within one interval" — and fixed it for the
+  # CRON by moving to */20. But since the PAT landed, `workflow_run` is the
+  # dominant trigger and it has no cadence at all: producers finish in bursts,
+  # so ticks arrive minutes apart, and a tick needs ~2 min of runner queue plus
+  # ~2 min of reconcile. Measured on one fleet account, 2026-08-06 16:01-16:45Z:
+  # ELEVEN consecutive supervisor runs, every one `cancelled`, not one reconcile
+  # completed — a livelock in which the fleet at 0/10 stayed at 0/10 while the
+  # supervisor looked busy.
+  #
+  # With `false`, GitHub still collapses a burst — it keeps at most ONE pending
+  # run per group and discards the rest — but the tick that is running gets to
+  # finish. "Always act on fresh state" survives via that queued successor,
+  # which starts from a freshly listed fleet anyway. Nothing here is
+  # order-sensitive: every tick is a full reconcile from live GitHub state.
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      # ── THE ONE ASSIGNMENT THAT MAKES THE CHAIN SELF-SUSTAINING.
+      # fleet_master.py takes its credential from GH_TOKEN and uses it for every
+      # API call it makes — listing runs, reading jobs, dispatching, cancelling
+      # — so preferring the PAT here is the entire credential change.
+      #
+      # An unset secret evaluates to the empty string, which `||` treats as
+      # false, so an account with no PAT silently falls back to the default
+      # token and behaves exactly as it did before. See the header block.
+      GH_TOKEN: ${{ secrets.FLEET_DISPATCH_PAT || github.token }}
+      # "true" / "false" — the FACT of which credential is in use, and nothing
+      # else. Never expose any part of the token itself, here or in a log line.
+      FLEET_PAT_PRESENT: ${{ secrets.FLEET_DISPATCH_PAT != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make the ledger directory
+        run: mkdir -p .fleet-state
+
+      # ── THE LIVENESS LEDGER.  One JSON file: {run id -> when that run was
+      # last KNOWN to be minting}.  It exists because a producer that stops
+      # minting disappears from /stats/exits within minutes — WARP hands its
+      # address to another producer and the relay wipes the row — so absence is
+      # the signal, and absence carries no clock.  This is the clock.
+      #
+      # Losing it is harmless by construction: every run then re-anchors to the
+      # start of its own Produce step, so nothing can be judged for one full
+      # --stall-seconds.  `restore-keys` picks up the newest surviving entry, and
+      # the key is unique per run because cache entries are immutable.
+      - name: Restore the minting-liveness ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: .fleet-state
+          key: camoufox-mint-liveness-${{ github.run_id }}
+          restore-keys: camoufox-mint-liveness-
+
+      - name: Reconcile the WARP fleet
+        shell: bash
+        env:
+          # Empty unless the operator has set the secret, and an empty value
+          # switches the minting check OFF and restores this supervisor's
+          # previous behaviour exactly. Same secret the producers already hold.
+          #   gh secret set RELAY_STATS_AUTH -R <repo> -b '<X-Auth>'
+          RELAY_AUTH: ${{ secrets.RELAY_STATS_AUTH }}
+        run: |
+          set -euo pipefail
+
+          # ── TWO FACTS THAT ARE OTHERWISE ONLY ANSWERABLE BY WATCHING A FLEET
+          # FOR HOURS. The failure these fix is invisible by nature: GitHub
+          # shows this workflow `active`, every prior run reads `success`, and
+          # the producers that are left are genuinely producing, right up until
+          # somebody notices the count is 2 of 10.
+          #
+          #   1. "did the PAT actually take effect on this account?" — one line,
+          #      no token material, so it is safe in a public repo's log.
+          #   2. "is the chain firing?" — the waking event, so the run history
+          #      itself shows completion-driven ticks rather than only cron.
+          if [[ "${FLEET_PAT_PRESENT}" == "true" ]]; then
+            echo "credential: FLEET_DISPATCH_PAT (user PAT) — dispatches raise workflow_run, so the chain continues"
+          else
+            echo "credential: default GITHUB_TOKEN (no FLEET_DISPATCH_PAT secret) — dispatches raise NO events, so the chain stops after one hop"
+          fi
+          # The default env var, NOT a workflow expression: nothing from the
+          # event is interpolated into this script.
+          #
+          # (And never write an empty expression — even inside a bash comment.
+          # GitHub scans the whole `run:` block for them and rejects the file
+          # with "An expression was expected"; `yaml.safe_load` in the upload
+          # gate does not, so this shipped a workflow that would not parse and
+          # the supervisor stopped ticking entirely until it was re-uploaded.
+          # The gate now checks for it.)
+          echo "woken by: ${GITHUB_EVENT_NAME}"
+
+          dry=""
+          if [[ '${{ inputs.dry_run }}' == 'true' ]]; then dry="--dry-run"; fi
+          # Every knob that the operator may want to turn in a hurry is a repo
+          # VARIABLE, not a literal here: variables change with one API call and
+          # take effect on the next tick, with no commit and no workflow run to
+          # race. An unset or unparseable value fails safe (disabled / target 0).
+          # WHICH PRODUCER THIS DISPATCHES IS THE WHOLE BALLGAME.
+          #
+          # This said `gartic-camoufox-producers.yml` until 2026-07-31. That
+          # workflow has NO CLICK DRIVER, and since Cloudflare started escalating
+          # every challenge to interactive on 2026-07-27 a browser nobody drives
+          # never clicks: it has minted ZERO ever since. The failure is silent —
+          # the runs go green, the supervisor counts them as productive, and the
+          # relay simply never sees a token. Enabling the fleet against it would
+          # have spawned CAMOUFOX_FLEET_TARGET runners producing nothing.
+          #
+          # `gartic-camoufox-fleet.yml` is the self-healing Camoufox producer
+          # (xdotool click driver + roomverify self-scoring + fingerprint ladder)
+          # measured at 3046 tokens / 98.6% accepted over 5 h on 2026-07-31.
+          #
+          # It is a VARIABLE so reverting is one API call rather than an upload:
+          #   PATCH .../actions/variables/CAMOUFOX_FLEET_WORKFLOW
+          #     {"name":"CAMOUFOX_FLEET_WORKFLOW","value":"<file>.yml"}
+          python3 'turnstile-system/token generators/camoufox-fresh/fleet_master.py' \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow "${{ vars.CAMOUFOX_FLEET_WORKFLOW || 'gartic-camoufox-fleet.yml' }}" \
+            --branch "${GITHUB_REF_NAME:-main}" \
+            --tunnel "${{ vars.CAMOUFOX_FLEET_TUNNEL || 'warp' }}" \
+            --enabled "${{ vars.CAMOUFOX_FLEET_ENABLED }}" \
+            --target "${{ vars.CAMOUFOX_FLEET_TARGET || '0' }}" \
+            --hard-cap "${{ vars.CAMOUFOX_FLEET_HARD_CAP || '12' }}" \
+            --runner-ceiling "${{ vars.CAMOUFOX_FLEET_CEILING || '20' }}" \
+            --reserve-slots "${{ vars.CAMOUFOX_FLEET_RESERVE || '2' }}" \
+            --duration-seconds "${{ vars.CAMOUFOX_FLEET_DURATION || '20800' }}" \
+            --overlap-seconds "${{ vars.CAMOUFOX_FLEET_OVERLAP || '1500' }}" \
+            --post-to-relay "${{ vars.CAMOUFOX_FLEET_RELAY || 'true' }}" \
+            --max-dispatch-per-cycle "${{ vars.CAMOUFOX_FLEET_RAMP || '4' }}" \
+            --max-cancel-per-cycle "${{ vars.CAMOUFOX_FLEET_SHRINK || '0' }}" \
+            --relay-exits-url "${{ vars.CAMOUFOX_FLEET_EXITS_URL || 'https://mohanadino.duckdns.org:8443/stats/exits' }}" \
+            --state-file .fleet-state/mint-liveness.json \
+            --stall-seconds "${{ vars.CAMOUFOX_FLEET_STALL_SECONDS || '2700' }}" \
+            --stall-startup-seconds "${{ vars.CAMOUFOX_FLEET_STALL_STARTUP || '900' }}" \
+            --max-stall-cancel-per-cycle "${{ vars.CAMOUFOX_FLEET_STALL_CANCEL || '0' }}" \
+            $dry
+
+      # Written even when the reconcile step fails, so a crash mid-cycle cannot
+      # throw away the clock and hand every runner a fresh --stall-seconds of
+      # immunity. A cancelled tick (concurrency: cancel-in-progress) skips this;
+      # the next tick then restores an older entry, which is safe — any sighting
+      # overwrites a stale value, so only genuinely absent runners carry it on.
+      - name: Save the minting-liveness ledger
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .fleet-state
+          key: camoufox-mint-liveness-${{ github.run_id }}
+
+      - name: Relay standing depth
+        if: always()
+        shell: bash
+        run: |
+          # Recorded every tick so the supervisor's own history doubles as a
+          # time series of what the fleet is actually achieving. Standing depth
+          # = production x usable TTL, so `queued` is the number the fleet size
+          # is really aimed at.
+          curl -ks --max-time 20 https://mohanadino.duckdns.org:8443/stats || true
+          echo
